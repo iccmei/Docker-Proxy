@@ -45,6 +45,12 @@ router.put('/config', requireLogin, async (req, res) => {
 router.post('/reload', requireLogin, async (req, res) => {
   try {
     const result = await goProxyService.reload();
+    // 重新加载后重新读取一次当前配置，确保手工修改 config.yaml 后内部凭证表同步更新。
+    try {
+      await registryCredentialService.syncFromLiveGoProxyConfig();
+    } catch (syncErr) {
+      logger.warn('重载后同步 Registry 凭证失败:', syncErr.message);
+    }
     res.json(result);
   } catch (e) {
     logger.error('重载 Go 代理配置失败:', e.message);
@@ -60,6 +66,18 @@ router.get('/status', async (req, res) => {
     res.json({ ...s, adminUrl: ADMIN_BASE });
   } catch (e) {
     res.status(502).json({ reachable: false, error: e.message, adminUrl: ADMIN_BASE });
+  }
+});
+
+// 按客户端 IP 的流量统计（来自 go-proxy /-/stats）
+router.get('/stats', requireLogin, async (req, res) => {
+  try {
+    const data = await goProxyService.getStats();
+    res.json(data);
+  } catch (e) {
+    logger.error('获取代理流量统计失败:', e.message);
+    const err = upstreamError(e);
+    res.status(err.status || 502).json(err.body);
   }
 });
 

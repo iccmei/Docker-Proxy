@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -47,14 +48,47 @@ type ServerConfig struct {
 	WriteTimeout int    `yaml:"write_timeout" json:"write_timeout"` // seconds; 0 -> unlimited (needed for streaming large blobs)
 	IdleTimeout  int    `yaml:"idle_timeout" json:"idle_timeout"`   // seconds; 0 -> 120
 	AdminListen  string `yaml:"admin_listen" json:"admin_listen"`   // management API address, default :5001 (NOT publicly exposed)
+
+	// StatsIdleTimeout is the duration after which an unused per-client traffic
+	// record (lastSeen older than the cutoff) is evicted by the stats janitor.
+	// 0 disables janitor cleanup and retains records indefinitely (NOT recommended:
+	// unbounded growth from scanning clients). Seconds; 0 -> 3600 (1h).
+	StatsIdleTimeout int `yaml:"stats_idle_timeout" json:"stats_idle_timeout"`
+	// StatsJanitorInterval is how often the janitor sweeps stale records.
+	// Seconds; 0 -> 300 (5min). Should be << StatsIdleTimeout.
+	StatsJanitorInterval int `yaml:"stats_janitor_interval" json:"stats_janitor_interval"`
+}
+
+// AccessControlMode enumerates the IP filtering modes.
+type AccessControlMode string
+
+const (
+	// ACLModeOff disables IP filtering (default).
+	ACLModeOff AccessControlMode = "off"
+	// ACLModeWhitelist allows only listed CIDRs/IPs, denies everything else.
+	ACLModeWhitelist AccessControlMode = "whitelist"
+	// ACLModeBlacklist denies listed CIDRs/IPs, allows everything else.
+	ACLModeBlacklist AccessControlMode = "blacklist"
+)
+
+// AccessControl configures per-request IP allow/deny at the proxy layer.
+// It only affects the PUBLIC registry proxy (Proxy.ServeHTTP); the management
+// API port (:5001) is deliberately NOT gated so the list can always be edited
+// from the admin UI. Each entry may be a single IPv4/IPv6 address or a CIDR
+// network (e.g. "192.168.1.0/24", "2001:db8::/32"). Inline "# comment" is allowed.
+type AccessControl struct {
+	Mode      AccessControlMode `yaml:"mode" json:"mode"`             // off | whitelist | blacklist
+	Whitelist []string          `yaml:"whitelist" json:"whitelist"`  // allowed CIDRs/IPs (used in whitelist mode)
+	Blacklist []string          `yaml:"blacklist" json:"blacklist"`  // denied CIDRs/IPs (used in blacklist mode)
 }
 
 // Config is the top-level configuration.
 type Config struct {
-	Server    ServerConfig      `yaml:"server" json:"server"`
-	Default   string            `yaml:"default" json:"default"`         // registry name used when Host does not match
-	LogLevel  string            `yaml:"log_level" json:"log_level"`     // quiet | normal (default) | debug
-	Registries []RegistryConfig `yaml:"registries" json:"registries"`
+	Server        ServerConfig      `yaml:"server" json:"server"`
+	Default       string            `yaml:"default" json:"default"`               // registry name used when Host does not match
+	LogLevel      string            `yaml:"log_level" json:"log_level"`           // quiet | normal (default) | debug
+	AccessControl AccessControl     `yaml:"access_control" json:"access_control"` // IP 黑白名单（代理层）
+	Registries    []RegistryConfig  `yaml:"registries" json:"registries"`
 }
 
 // normalizeConfig fills in defaults that are not expressible via zero values
@@ -78,6 +112,16 @@ func normalizeConfig(cfg *Config) {
 			t := true
 			r.Enabled = &t
 		}
+	}
+	// Normalize the access-control mode so an empty string behaves as "off".
+	switch cfg.AccessControl.Mode {
+	case "", ACLModeOff, ACLModeWhitelist, ACLModeBlacklist:
+	default:
+		log.Printf("[WARN] access_control.mode %q 非法，已重置为 off", cfg.AccessControl.Mode)
+		cfg.AccessControl.Mode = ACLModeOff
+	}
+	if cfg.AccessControl.Mode == "" {
+		cfg.AccessControl.Mode = ACLModeOff
 	}
 }
 

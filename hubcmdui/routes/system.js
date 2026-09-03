@@ -14,6 +14,7 @@ const { execCommand, getSystemInfo } = require('../server-utils');
 const dockerService = require('../services/dockerService');
 const systemService = require('../services/systemService');
 const networkTestService = require('../services/networkTestService');
+const trafficService = require('../services/trafficService');
 const path = require('path');
 const fs = require('fs').promises;
 
@@ -114,16 +115,17 @@ async function getSystemStats(req, res) {
   }
 }
 
-// 获取系统配置 - 修改版本，避免与其他路由冲突
-router.get('/system-config', async (req, res) => {
+// 读取系统配置（强制鉴权；响应中 telegramToken / webhook 字段需要脱敏，避免前端
+// 拿到明文后再回显到日志或网络面板。即便是 "已登录" 也不应把 webhook URL 全量返回）。
+router.get('/system-config', requireLogin, async (req, res) => {
   try {
     const config = await configServiceDB.getConfig();
-    res.json(config);
+    res.json(redactSystemConfig(config));
   } catch (error) {
     logger.error('读取配置失败:', error);
-    res.status(500).json({ 
-      error: '读取配置失败', 
-      details: error.message 
+    res.status(500).json({
+      error: '读取配置失败',
+      details: error.message
     });
   }
 });
@@ -135,15 +137,41 @@ router.post('/system-config', requireLogin, async (req, res) => {
     const newConfig = { ...currentConfig, ...req.body };
     await configServiceDB.saveConfigs(newConfig);
     logger.info('系统配置已更新');
-    res.json({ success: true });
+    // 同样脱敏后再返回
+    res.json({ success: true, config: redactSystemConfig(newConfig) });
   } catch (error) {
     logger.error('保存配置失败:', error);
-    res.status(500).json({ 
-      error: '保存配置失败', 
-      details: error.message 
+    res.status(500).json({
+      error: '保存配置失败',
+      details: error.message
     });
   }
 });
+
+// 系统配置读取脱敏：即使管理员已登录，也不应在响应中泄漏：
+//   - telegramToken / botToken（高权限、可控账号）
+//   - webhook URL（外发通道，会被日志/浏览器历史留存）
+// 改为返回布尔 `hasWebhook` 与 `hasTelegramToken`，前端用"已设置 / 未设置"展示；
+// 真正修改时再以 sentinel `********` 走写路径（兼容层使用）。
+function redactSystemConfig(config) {
+  if (!config || typeof config !== 'object') return {};
+  const out = { ...config };
+  const URL_HINT = /^[a-z][a-z0-9+.-]*:\/\//i;
+  const sensitiveKeyList = ['telegramToken', 'botToken', 'webhookUrl', 'webhook', 'telegramChatId'];
+  for (const key of Object.keys(out)) {
+    const lower = key.toLowerCase();
+    const isSensitive =
+      sensitiveKeyList.some(s => lower.includes(s.toLowerCase())) ||
+      (lower.includes('token') && typeof out[key] === 'string') ||
+      (lower.includes('webhook') && typeof out[key] === 'string') ||
+      (lower.includes('secret') && typeof out[key] === 'string');
+    if (isSensitive) {
+      // 写明脱敏规则：有值标记为 sentinel；前端用 placeholder / has* 区分
+      out[key] = out[key] ? '********' : '';
+    }
+  }
+  return out;
+}
 
 // 获取系统状态
 router.get('/stats', requireLogin, async (req, res) => {
@@ -405,5 +433,20 @@ function formatBytes(bytes, decimals = 2) {
     
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
+
+// 网络流量监控：当前实时速率 + 历史吞吐曲线 + 窗口内总量
+router.get('/network-traffic', requireLogin, async (req, res) => {
+  try {
+    const hours = Math.min(Math.max(parseInt(req.query.hours) || 24, 1), 24 * 7);
+    const [current, history] = await Promise.all([
+      trafficService.getCurrent(),
+      trafficService.getHistory(hours)
+    ]);
+    res.json({ current, history });
+  } catch (error) {
+    logger.error('获取网络流量失败:', error);
+    res.status(500).json({ error: '获取网络流量失败', message: error.message });
+  }
+});
 
 module.exports = router; // 只导出 router

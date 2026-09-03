@@ -5,21 +5,82 @@ const api = axios.create({
   withCredentials: true
 })
 
+// =====================================================================
+// H1 配套：默认密码会话触发 403 NEED_CHANGE_PASSWORD 时的全局锁屏兜底
+//
+// 登录页 Login.vue 自带更丰富的「带默认凭证提示」dialog（首次登录即拦截）。
+// 这里专门处理「点稍后进入主界面后再发起的 API 请求」场景——
+// 后端 requireFreshPassword 会把所有非白名单接口返 403，没拦截的话 dashboard /
+// 列表会静默卡死，用户完全搞不清状况。
+//
+// 关键设计：
+//  - 用动态 import 加载 router / element-plus：避免 services ↔ router ↔ views
+//    形成循环依赖（services 已被 Login.vue / Landing.vue 等视图静态引入）。
+//  - _pwdDialogShown 闸门：并发 403（dashboard 一启动就拉 5 个接口）只弹一次。
+//  - 当前已在 user 中心页时不重复 push：避免 vue-router 4 的 NavigationDuplicated。
+// =====================================================================
+let _pwdDialogShown = false
+const _loadRouter = () => import('../router').then(m => m.default)
+const _loadElMsgBox = () => import('element-plus').then(m => m.ElMessageBox)
+
+async function _handleDefaultPasswordLockout() {
+  try {
+    const [router, { ElMessageBox }] = await Promise.all([
+      _loadRouter(),
+      _loadElMsgBox()
+    ])
+    if (router.currentRoute?.value?.name !== 'user') {
+      // 已在 /admin/user 时跳过 push；vue-router 4 对重复路由会抛 NavigationDuplicated
+      try {
+        await router.push({ name: 'user', query: { forceChange: '1' } })
+      } catch (e) { /* 静默吞掉 */ }
+    }
+    await ElMessageBox.alert(
+      '当前会话仍使用出厂默认密码，请先修改密码后再使用其他功能',
+      '安全提示',
+      {
+        confirmButtonText: '立即修改',
+        showClose: false,
+        type: 'warning'
+      }
+    )
+  } catch (e) {
+    // 拦截器自身失败不应影响主流程；闸门仍需在 finally 重置，否则后续 403 全静音
+  } finally {
+    _pwdDialogShown = false
+  }
+}
+
 api.interceptors.response.use(
   (res) => res,
   (err) => {
     if (err.response && err.response.status === 401) {
       // 会话过期，交给调用方处理
     }
+    // 默认密码会话触发 403 + NEED_CHANGE_PASSWORD：全局兜底拦截
+    if (
+      err?.response?.status === 403 &&
+      err.response.data?.code === 'NEED_CHANGE_PASSWORD' &&
+      !_pwdDialogShown
+    ) {
+      _pwdDialogShown = true
+      _handleDefaultPasswordLockout()
+    }
     return Promise.reject(err)
   }
 )
 
 // ============ 鉴权 ============
-export const getCaptcha = () => api.get('/captcha').then(r => r.data)
+// 取码时服务端会下发 captchaId，登录/重置时须原样回传，便于服务端校验。
+// 验证码已与 session 解耦，避免并发请求抢走 session cookie 导致校验失败。
+let _captchaId = null
+export const getCaptcha = () => api.get('/captcha').then(r => {
+  _captchaId = r.data && r.data.captchaId
+  return r.data
+})
 export const login = (payload) => {
   const { username, password, captcha } = payload || {}
-  return api.post('/login', { username, password, captcha }).then(r => r.data)
+  return api.post('/login', { username, password, captcha, captchaId: _captchaId }).then(r => r.data)
 }
 export const logout = () => api.post('/logout').then(r => r.data)
 export const checkSession = () => api.get('/check-session').then(r => r.data)
@@ -29,7 +90,7 @@ export const changeUsername = (newUsername, password) =>
   api.post('/change-username', { newUsername, password }).then(r => r.data)
 export const getUserInfo = () => api.get('/user-info').then(r => r.data)
 export const requestResetToken = (username, captcha) =>
-  api.post('/request-reset-token', { username, captcha }).then(r => r.data)
+  api.post('/request-reset-token', { username, captcha, captchaId: _captchaId }).then(r => r.data)
 export const resetPassword = (token, newPassword, confirmPassword) =>
   api.post('/reset-password', { token, newPassword, confirmPassword }).then(r => r.data)
 export const validateResetToken = (token) =>
@@ -39,6 +100,9 @@ export const validateResetToken = (token) =>
 export const getConfig = () => api.get('/config').then(r => r.data)
 // 站点锁定信息（GitHub 地址等，后端加密存储且不可更改）
 export const getSiteInfo = () => api.get('/site').then(r => r.data)
+// 前台落地页（/）展示开关：公开读、后管写（requireLogin）
+export const getLandingVisible = () => api.get('/site/landing-visible').then(r => r.data)
+export const setLandingVisible = (visible) => api.post('/site/landing-visible', { visible }).then(r => r.data)
 export const saveConfig = (cfg) => api.post('/config', cfg).then(r => r.data)
 export const getMenuItems = () => api.get('/menu/items').then(r => r.data)
 export const saveMenuItems = (menuItems) =>
@@ -61,6 +125,9 @@ export const getSystemResourceDetails = () =>
 export const getDiskSpace = () => api.get('/disk-space').then(r => r.data)
 export const networkTest = (payload) =>
   api.post('/network-test', payload).then(r => r.data)
+export const getNetworkTraffic = (hours = 24) =>
+  api.get('/network-traffic', { params: { hours } }).then(r => r.data)
+export const getProxyStats = () => api.get('/goProxy/stats').then(r => r.data)
 
 // ============ Docker 容器 ============
 export const getDockerStatus = () => api.get('/docker/status').then(r => r.data)
@@ -80,10 +147,10 @@ export const searchAllRegistries = (term, page = 1, limit = 10) =>
   api.get('/registry/search-all', { params: { term, page, limit } }).then(r => r.data)
 export const searchRegistry = (registryId, term, page = 1, limit = 25) =>
   api.get(`/registry/search/${registryId}`, { params: { term, page, limit } }).then(r => r.data)
-export const getImageTags = (registryId, name, page = 1, limit = 100) =>
-  api.get(`/registry/tags/${registryId}`, { params: { name, page, limit } }).then(r => r.data)
-export const getTagCount = (registryId, name) =>
-  api.get(`/registry/tag-count/${registryId}`, { params: { name } }).then(r => r.data)
+export const getImageTags = (registryId, name, page = 1, limit = 100, sourceRepository = '') =>
+  api.get(`/registry/tags/${registryId}`, { params: { name, page, limit, sourceRepository } }).then(r => r.data)
+export const getTagCount = (registryId, name, sourceRepository = '') =>
+  api.get(`/registry/tag-count/${registryId}`, { params: { name, sourceRepository } }).then(r => r.data)
 
 // ============ Docker Hub 搜索 ============
 export const searchDockerHub = (term, page = 1, limit = 25) =>
@@ -110,6 +177,10 @@ export const getGoConfig = () => api.get('/goProxy/config').then(r => r.data)
 export const saveGoConfig = (cfg) => api.put('/goProxy/config', cfg).then(r => r.data)
 export const reloadGoProxy = () => api.post('/goProxy/reload').then(r => r.data)
 export const goProxyStatus = () => api.get('/goProxy/status').then(r => r.data)
+
+// ============ IP 访问控制（代理层） ============
+export const getIpAccess = () => api.get('/ipAccess').then(r => r.data)
+export const saveIpAccess = (cfg) => api.put('/ipAccess', cfg).then(r => r.data)
 
 // ============ 监控 ============
 export const getMonitoringConfig = () => api.get('/monitoring-config').then(r => r.data)

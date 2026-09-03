@@ -14,10 +14,12 @@ const { downloadImages } = require('./download-images');
 const { gracefulShutdown } = require('./cleanup');
 const os = require('os');
 const { requireLogin } = require('./middleware/auth');
+const { requireFreshPassword } = require('./middleware/auth');
 const compatibilityLayer = require('./compatibility-layer');
 const { initializeDatabase } = require('./scripts/init-database');
 const database = require('./database/database');
 const httpProxyService = require('./services/httpProxyService');
+const registryCredentialService = require('./services/registryCredentialService');
 
 // 设置日志级别 (默认INFO, 可通过环境变量设置)
 const logLevel = process.env.LOG_LEVEL || 'WARN';
@@ -37,29 +39,45 @@ const { executeOnce } = require('./lib/initScheduler');
 const app = express();
 const server = http.createServer(app);
 
+app.set('trust proxy', 1);
+
 // 配置中间件
 app.use(cors());
 app.use(express.json());
 // 托管 Vue 构建产物（npm run build 输出到 web/dist），用于生产环境提供新前端
 app.use(express.static(path.join(__dirname, 'web', 'dist')));
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(session({
+const sessionMiddleware = session({
   secret: config.sessionSecret || 'OhTq3faqSKoxbV%NJV',
-  resave: true,
-  saveUninitialized: true,
+  // 未修改的请求不回写 Session，避免登录前的并发检查覆盖登录态。
+  resave: false,
+  // 未登录请求不创建空 Session/Cookie，减少并发响应抢写 connect.sid。
+  saveUninitialized: false,
   cookie: {
     // Secure 仅在 HTTPS 下才应开启；明文访问(如 http://IP:30080)必须关闭，
     // 否则浏览器拒绝保存 cookie，导致会话丢失、验证码永远报错。
-    // 优先级：环境变量 SECURE_COOKIE(true/false) > 配置文件中的 secureSession。
+    // 优先级：环境变量 SECURE_COOKIE(true/false) > 自动检测（基于 req.secure，由下方中间件实现）。
     secure: process.env.SECURE_COOKIE === 'true' ? true
           : process.env.SECURE_COOKIE === 'false' ? false
-          : (config.secureSession || false),
+          : undefined, // 未显式设置时交给下方 autoSecureCookie 中间件按真实协议判断
     sameSite: 'lax',
     httpOnly: true,
     path: '/',
     maxAge: 7 * 24 * 60 * 60 * 1000 // 7天(一周)
   }
-}));
+});
+app.use(sessionMiddleware);
+
+// 根据真实协议自动设置 session cookie 的 Secure 标志（仅当 SECURE_COOKIE 未显式设置时生效）。
+// 必须在 session 中间件之后，确保 req.session.cookie 已存在；
+// 在响应结束前执行，使后续 req.session.save() / 自动保存使用正确的 Secure 标志。
+app.use((req, res, next) => {
+  if (process.env.SECURE_COOKIE === undefined && req.session && req.session.cookie) {
+    // req.secure 在已设置 trust proxy 的情况下会反映原始协议（HTTPS 经 Cloudflare 时为 true）。
+    req.session.cookie.secure = !!req.secure;
+  }
+  next();
+});
 
 // 自定义中间件
 app.use(sessionActivity);
@@ -106,14 +124,11 @@ registerRoutes(app);
 // 提供兼容层以确保旧接口继续工作
 require('./compatibility-layer')(app);
 
-// 确保登录路由可用
-try {
-  const loginRouter = require('./routes/login');
-  app.use('/api', loginRouter);
-  logger.success('✓ 已添加备用登录路由');
-} catch (loginError) {
-  logger.error('无法加载备用登录路由:', loginError);
-}
+// 默认密码守卫：登录时若仍使用出厂默认密码，会在 session.passwordIsDefault 中写入。
+// 此处全局拦截 /api/*，强制只允许改密、改用户名、登出、check-session 等特定接口，
+// 其余 API 一律 403 NEED_CHANGE_PASSWORD，迫使前端弹出强制改密弹窗。
+// 未登录会话直接放行，由各路由自身的 requireLogin 决定是否拒绝。
+app.use('/api', (req, res, next) => requireFreshPassword(req, res, next));
 
 // 页面路由：统一返回 Vue 构建产物（web/dist/index.html）。
 // 旧的 jQuery 前端（web/index.html / web/admin.html / web/docs.html）已删除，
@@ -166,6 +181,18 @@ app.use((err, req, res, next) => {
 // 启动服务器
 const PORT = process.env.PORT || 3000;
 
+// 启动期对 GO_PROXY_ADMIN_TOKEN 做硬校验：缺失、占位符、过短均直接抛错，
+// 防止管理端口裸露。失败时由 uncaughtException 处理器在 3s 后退出，
+// 留出窗口便于运维看到致命日志。
+try {
+  require('./services/goProxyService').validateAdminTokenAtStartup();
+} catch (adminTokenErr) {
+  logger.fatal('启动期 GO_PROXY_ADMIN_TOKEN 校验失败：', adminTokenErr.message);
+  // 不静默继续运行：管理端口没有 token 等于裸奔，直接终止进程。
+  setTimeout(() => process.exit(1), 1500);
+  throw adminTokenErr;
+}
+
 async function startServer() {
   server.listen(PORT, async () => {
     logger.info(`服务器已启动并监听端口 ${PORT}`);
@@ -214,6 +241,17 @@ async function startServer() {
       } catch (initError) {
         logger.warn('系统配置初始化遇到问题:', initError.message);
       }
+
+      // 启动时从 Go 代理当前配置同步 Registry 凭证。
+      // 这样即使用户直接编辑 /data/proxy/config/go-proxy/config.yaml，
+      // 只要 hubcmd-ui 重启或首次启动，就能把 ghcr/quay 等受限仓库所需凭证
+      // 通过加密同步接口写入内部表供标签查询复用。
+      try {
+        const synced = await registryCredentialService.syncFromLiveGoProxyConfig();
+        logger.success(`Registry 凭证同步完成，已同步 ${synced} 条`);
+      } catch (credSyncError) {
+        logger.warn('Registry 凭证同步失败:', credSyncError.message);
+      }
       
       // 启动资源指标采集器（每 30s 采集 CPU/内存/磁盘使用率并落库，
       // 使「资源使用趋势」历史跨设备/跨会话统一保存）
@@ -249,7 +287,7 @@ async function startServer() {
       try {
         const dockerRouter = require('./routes/docker');
         if (typeof dockerRouter.setupLogWebsocket === 'function') {
-          dockerRouter.setupLogWebsocket(server);
+          dockerRouter.setupLogWebsocket(server, sessionMiddleware);
           logger.success('WebSocket服务已启动');
         }
       } catch (wsError) {

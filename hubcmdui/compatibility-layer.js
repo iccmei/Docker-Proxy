@@ -10,19 +10,11 @@ const util = require('util');
 const execPromise = util.promisify(exec);
 const networkTestService = require('./services/networkTestService');
 const systemService = require('./services/systemService');
-const { generateCaptchaCode, verifyCaptcha } = require('./lib/captcha');
+const trafficService = require('./services/trafficService');
+const configServiceDB = require('./services/configServiceDB');
 
 module.exports = function(app) {
   logger.info('加载API兼容层...');
-  
-  // 会话检查接口
-  app.get('/api/check-session', (req, res) => {
-    if (req.session && req.session.user) {
-      res.json({ authenticated: true, user: req.session.user });
-    } else {
-      res.json({ authenticated: false });
-    }
-  });
   
   // 添加Docker状态检查接口，并使用 requireLogin 中间件
   app.get('/api/docker/status', requireLogin, async (req, res) => {
@@ -33,18 +25,6 @@ module.exports = function(app) {
     } catch (error) {
       logger.error('检查Docker状态失败:', error);
       res.status(500).json({ error: '检查Docker状态失败', details: error.message });
-    }
-  });
-  
-  // 验证码接口（随机字母/数字，大小写不敏感）
-  app.get('/api/captcha', (req, res) => {
-    try {
-      const captcha = generateCaptchaCode(4);
-      req.session.captcha = captcha; // 标准答案（大写）
-      res.json({ captcha });
-    } catch (error) {
-      logger.error('生成验证码失败:', error);
-      res.status(500).json({ error: '生成验证码失败' });
     }
   });
   
@@ -212,106 +192,63 @@ module.exports = function(app) {
     }
   });
   
-  // 监控配置接口
-  app.get('/api/monitoring-config', async (req, res) => {
+  // 监控配置接口（统一走 SQLite，与 monitoringService 同源）
+  app.get('/api/monitoring-config', requireLogin, async (req, res) => {
     try {
-      logger.info('兼容层处理监控配置请求');
-      const fs = require('fs').promises;
-      const path = require('path');
-      
-      // 监控配置文件路径
-      const CONFIG_FILE = path.join(__dirname, './config/monitoring.json');
-      
-      // 确保配置文件存在
-      try {
-        await fs.access(CONFIG_FILE);
-      } catch (err) {
-        // 文件不存在，创建默认配置
-        const defaultConfig = {
-          isEnabled: false,
-          notificationType: 'wechat',
-          webhookUrl: '',
-          telegramToken: '',
-          telegramChatId: '',
-          monitorInterval: 60
-        };
-        
-        await fs.mkdir(path.dirname(CONFIG_FILE), { recursive: true });
-        await fs.writeFile(CONFIG_FILE, JSON.stringify(defaultConfig, null, 2), 'utf8');
-        return res.json(defaultConfig);
-      }
-      
-      // 文件存在，读取配置
-      const data = await fs.readFile(CONFIG_FILE, 'utf8');
-      res.json(JSON.parse(data));
+      const config = await configServiceDB.getMonitoringConfig();
+      res.json(config);
     } catch (err) {
       logger.error('获取监控配置失败:', err);
       res.status(500).json({ error: '获取监控配置失败' });
     }
   });
   
-  // 保存监控配置接口
-  app.post('/api/monitoring-config', async (req, res) => {
+  // 保存监控配置接口（统一走 SQLite，与 monitoringService 同源）
+  app.post('/api/monitoring-config', requireLogin, async (req, res) => {
     try {
-      logger.info('兼容层处理保存监控配置请求');
-      const fs = require('fs').promises;
-      const path = require('path');
-      
-      const { 
-        notificationType, 
-        webhookUrl, 
-        telegramToken, 
-        telegramChatId, 
+      const {
+        notificationType,
+        webhookUrl,
+        telegramToken,
+        telegramChatId,
         monitorInterval,
-        isEnabled
+        isEnabled,
+        enableTrafficAlert,
+        rxRateThreshold,
+        txRateThreshold,
+        dailyTrafficThreshold,
+        singleIpDailyThreshold
       } = req.body;
-      
+
       // 简单验证
       if (notificationType === 'wechat' && !webhookUrl) {
         return res.status(400).json({ error: '企业微信通知需要设置 webhook URL' });
       }
-      
+
       if (notificationType === 'telegram' && (!telegramToken || !telegramChatId)) {
         return res.status(400).json({ error: 'Telegram 通知需要设置 Token 和 Chat ID' });
       }
-      
-      // 监控配置文件路径
-      const CONFIG_FILE = path.join(__dirname, './config/monitoring.json');
-      
-      // 确保配置文件存在
-      let config = {
-        isEnabled: false,
-        notificationType: 'wechat',
-        webhookUrl: '',
-        telegramToken: '',
-        telegramChatId: '',
-        monitorInterval: 60
-      };
-      
-      try {
-        const data = await fs.readFile(CONFIG_FILE, 'utf8');
-        config = JSON.parse(data);
-      } catch (err) {
-        // 如果读取失败，使用默认配置
-        logger.warn('读取监控配置失败，将使用默认配置:', err);
-      }
-      
-      // 更新配置
+
+      const currentConfig = await configServiceDB.getMonitoringConfig();
       const updatedConfig = {
-        ...config,
+        ...currentConfig,
         notificationType,
         webhookUrl: webhookUrl || '',
         telegramToken: telegramToken || '',
         telegramChatId: telegramChatId || '',
         monitorInterval: parseInt(monitorInterval, 10) || 60,
-        isEnabled: isEnabled !== undefined ? isEnabled : config.isEnabled
+        isEnabled: isEnabled !== undefined ? !!isEnabled : currentConfig.isEnabled,
+        enableTrafficAlert: enableTrafficAlert !== undefined ? !!enableTrafficAlert : currentConfig.enableTrafficAlert,
+        rxRateThreshold: parseFloat(rxRateThreshold) || 0,
+        txRateThreshold: parseFloat(txRateThreshold) || 0,
+        dailyTrafficThreshold: parseFloat(dailyTrafficThreshold) || 0,
+        singleIpDailyThreshold: parseFloat(singleIpDailyThreshold) || 0
       };
-      
-      await fs.mkdir(path.dirname(CONFIG_FILE), { recursive: true });
-      await fs.writeFile(CONFIG_FILE, JSON.stringify(updatedConfig, null, 2), 'utf8');
-      
+
+      await configServiceDB.saveMonitoringConfig(updatedConfig);
+
       res.json({ success: true, message: '监控配置已保存' });
-      
+
       // 通知监控服务重新加载配置
       if (global.monitoringService && typeof global.monitoringService.reload === 'function') {
         global.monitoringService.reload();
@@ -355,47 +292,19 @@ module.exports = function(app) {
     }
   });
   
-  // 切换监控状态接口
-  app.post('/api/toggle-monitoring', async (req, res) => {
+  // 切换监控状态接口（统一走 SQLite，与 monitoringService 同源）
+  app.post('/api/toggle-monitoring', requireLogin, async (req, res) => {
     try {
-      logger.info('兼容层处理切换监控状态请求');
-      const fs = require('fs').promises;
-      const path = require('path');
-      
       const { isEnabled } = req.body;
-      
-      // 监控配置文件路径
-      const CONFIG_FILE = path.join(__dirname, './config/monitoring.json');
-      
-      // 确保配置文件存在
-      let config = {
-        isEnabled: false,
-        notificationType: 'wechat',
-        webhookUrl: '',
-        telegramToken: '',
-        telegramChatId: '',
-        monitorInterval: 60
-      };
-      
-      try {
-        const data = await fs.readFile(CONFIG_FILE, 'utf8');
-        config = JSON.parse(data);
-      } catch (err) {
-        // 如果读取失败，使用默认配置
-        logger.warn('读取监控配置失败，将使用默认配置:', err);
-      }
-      
-      // 更新启用状态
+      const config = await configServiceDB.getMonitoringConfig();
       config.isEnabled = !!isEnabled;
-      
-      await fs.mkdir(path.dirname(CONFIG_FILE), { recursive: true });
-      await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
-      
-      res.json({ 
-        success: true, 
+      await configServiceDB.saveMonitoringConfig(config);
+
+      res.json({
+        success: true,
         message: `监控已${isEnabled ? '启用' : '禁用'}`
       });
-      
+
       // 通知监控服务重新加载配置
       if (global.monitoringService && typeof global.monitoringService.reload === 'function') {
         global.monitoringService.reload();
@@ -407,7 +316,7 @@ module.exports = function(app) {
   });
   
   // 测试通知接口
-  app.post('/api/test-notification', async (req, res) => {
+  app.post('/api/test-notification', requireLogin, async (req, res) => {
     try {
       logger.info('兼容层处理测试通知请求');
       
@@ -577,37 +486,6 @@ module.exports = function(app) {
     }
   });
   
-  // 登录接口 (兼容层备份)
-  app.post('/api/login', async (req, res) => {
-    try {
-      const { username, password, captcha } = req.body;
-      
-      if (!verifyCaptcha(req.session.captcha, captcha)) {
-        logger.warn(`Captcha verification failed for user: ${username}`);
-        return res.status(401).json({ error: '验证码错误' });
-      }
-
-      const userServiceDB = require('./services/userServiceDB');
-      const user = await userServiceDB.validateUser(username, password);
-      
-      if (!user) {
-        logger.warn(`User ${username} not found`);
-        return res.status(401).json({ error: '用户名或密码错误' });
-      }
-
-      req.session.user = { username: user.username };
-      
-      // 更新用户登录信息
-      await userServiceDB.updateUserLoginInfo(username);
-      
-      logger.info(`User ${username} logged in successfully`);
-      res.json({ success: true });
-    } catch (error) {
-      logger.error('登录失败:', error);
-      res.status(500).json({ error: '登录处理失败', details: error.message });
-    }
-  });
-  
   // 修复搜索函数问题 - 完善错误处理
   app.get('/api/search', async (req, res) => {
     try {
@@ -672,7 +550,7 @@ module.exports = function(app) {
   });
   
   // 兼容config API
-  app.get('/api/config', async (req, res) => {
+  app.get('/api/config', requireLogin, async (req, res) => {
     try {
       logger.info('兼容层处理配置请求');
       const fs = require('fs').promises;
@@ -727,7 +605,7 @@ module.exports = function(app) {
   });
   
   // 保存配置API
-  app.post('/api/config', async (req, res) => {
+  app.post('/api/config', requireLogin, async (req, res) => {
     try {
       logger.info('兼容层处理保存配置请求');
       const fs = require('fs').promises;
@@ -962,7 +840,22 @@ module.exports = function(app) {
       res.status(500).json({ error: '获取系统资源信息失败', message: error.message });
     }
   });
-  
+
+  // 网络流量监控：当前实时速率 + 历史吞吐曲线 + 窗口内总量
+  app.get('/api/network-traffic', requireLogin, async (req, res) => {
+    try {
+      const hours = Math.min(Math.max(parseInt(req.query.hours) || 24, 1), 24 * 7);
+      const [current, history] = await Promise.all([
+        trafficService.getCurrent(),
+        trafficService.getHistory(hours)
+      ]);
+      res.json({ current, history });
+    } catch (error) {
+      logger.error('获取网络流量失败:', error);
+      res.status(500).json({ error: '获取网络流量失败', message: error.message });
+    }
+  });
+
   // 登出接口
   app.post('/api/logout', (req, res) => {
     if (req.session) {

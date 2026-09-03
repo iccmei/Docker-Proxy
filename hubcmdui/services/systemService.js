@@ -179,7 +179,8 @@ async function getSystemResources() {
       system: {
         platform: osInfo.platform,
         release: osInfo.release,
-        hostname: osInfo.hostname || os.hostname(),
+        // Docker 中 osInfo.hostname 默认是容器 ID，优先使用部署时传入的 HOST_NAME 环境变量
+        hostname: process.env.HOST_NAME || osInfo.hostname || os.hostname(),
         uptime: Math.floor(os.uptime())   // 秒（数字），由前端 formatUptime 格式化
       }
     };
@@ -191,4 +192,26 @@ async function getSystemResources() {
   }
 }
 
-module.exports = { getSystemResources };
+/**
+ * 返回网卡累计字节数与实时速率（聚合所有非回环网卡）。
+ * 用于「网络流量监控」页：累计字节落库以便绘制历史吞吐曲线，
+ * 实时速率用于当前上下行速率卡。
+ * @returns {Promise<{rxBytes:number, txBytes:number, rxSec:number, txSec:number, interfaces:string[]}>}
+ */
+async function getNetworkCounters() {
+  const netStats = await si.networkStats('*');
+  const ifaces = aggregateNetworkStats(netStats);
+  const rxBytes = ifaces.reduce((s, n) => s + (Number(n.rx_bytes) || 0), 0);
+  const txBytes = ifaces.reduce((s, n) => s + (Number(n.tx_bytes) || 0), 0);
+  const speed = computeNetworkSpeed(netStats);
+  return {
+    rxBytes,
+    txBytes,
+    rxSec: speed.rxSec,
+    txSec: speed.txSec,
+    interfaces: speed.interfaces,
+    activeInterfaces: speed.activeInterfaces
+  };
+}
+
+module.exports = { getSystemResources, getNetworkCounters };

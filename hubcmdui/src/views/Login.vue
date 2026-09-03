@@ -6,55 +6,58 @@
     <div class="login-scrim"></div>
 
     <el-card class="login-card" shadow="never">
-      <!-- 品牌区：使用项目官方 logo 图片 -->
+      <div class="login-card-head">
+        <LangSwitch variant="icon" />
+      </div>
+      <!-- 品牌区：使用无文字项目图标 -->
       <div class="brand">
-        <img class="brand-logo" src="/images/docker-proxy.png" alt="Docker 镜像加速服务" />
+        <img class="brand-logo" src="/images/docker-proxy.svg" :alt="t('layout.brandName')" />
         <h1 class="brand-title">HubCmdUI</h1>
-        <p class="brand-sub">Docker 镜像代理加速系统 · 管理控制台</p>
+        <p class="brand-sub">{{ t('login.brandSub') }}</p>
       </div>
 
       <el-form :model="form" label-position="top" @submit.prevent="onSubmit">
-        <el-form-item label="用户名" class="field">
+        <el-form-item :label="t('login.username')" class="field">
           <el-input
             v-model="form.username"
-            placeholder="请输入用户名"
+            :placeholder="t('common.pleaseInput') + ' ' + t('login.username')"
             :prefix-icon="User"
             size="large"
           />
         </el-form-item>
 
-        <el-form-item label="密码" class="field">
+        <el-form-item :label="t('login.password')" class="field">
           <el-input
             v-model="form.password"
             type="password"
             show-password
-            placeholder="请输入密码"
+            :placeholder="t('common.pleaseInput') + ' ' + t('login.password')"
             :prefix-icon="Lock"
             size="large"
           />
         </el-form-item>
 
-        <el-form-item label="验证码" class="field">
+        <el-form-item :label="t('login.captcha')" class="field">
           <div class="captcha-row">
             <el-input
               v-model="form.captcha"
-              placeholder="请输入右侧验证码（不区分大小写）"
+              :placeholder="t('login.captchaPlaceholder')"
               :prefix-icon="Key"
               size="large"
             />
             <div
               class="captcha-box"
               :class="{ error: captchaError, loading: captchaLoading }"
-              title="点击刷新验证码"
+              :title="t('login.captchaPlaceholder')"
               @click="loadCaptcha"
             >
               <template v-if="captchaLoading">
                 <el-icon class="captcha-icon spin"><Loading /></el-icon>
-                <span class="captcha-hint">加载中</span>
+                <span class="captcha-hint">{{ t('login.loadingCaptcha') }}</span>
               </template>
               <template v-else-if="captchaError">
                 <el-icon class="captcha-icon"><Warning /></el-icon>
-                <span class="captcha-hint">点击重试</span>
+                <span class="captcha-hint">{{ t('login.captchaRetry') }}</span>
               </template>
               <template v-else>
                 <span class="captcha-code">{{ captchaText }}</span>
@@ -64,13 +67,13 @@
         </el-form-item>
 
         <el-button type="primary" :loading="loading" native-type="submit" class="submit-btn">
-          登 录
+          {{ t('login.loginBtn') }}
         </el-button>
       </el-form>
 
       <div class="login-foot">
         <i class="fas fa-shield-halved"></i>
-        连接已加密 · 仅授权用户可访问
+        {{ t('login.encryptedHint') }}
       </div>
     </el-card>
   </div>
@@ -79,10 +82,12 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useI18n } from 'vue-i18n'
 import { User, Lock, Key, Loading, Warning } from '@element-plus/icons-vue'
-import { getCaptcha, login, checkSession } from '../services'
+import { getCaptcha, login } from '../services'
 import { useAuth } from '../composables/useAuth'
+import LangSwitch from '../components/LangSwitch.vue'
 
 const props = defineProps({
   // 登录成功后跳转目标（来自 AdminShell 传入，保持 URL 干净）
@@ -94,6 +99,7 @@ const emit = defineEmits(['logged-in'])
 
 const route = useRoute()
 const router = useRouter()
+const { t } = useI18n()
 const { refresh } = useAuth()
 const form = ref({ username: '', password: '', captcha: '' })
 const captchaText = ref('')
@@ -123,22 +129,71 @@ async function loadCaptcha() {
 async function onSubmit() {
   if (loading.value) return
   if (!form.value.username || !form.value.password || !form.value.captcha) {
-    ElMessage.warning('请填写完整信息')
+    ElMessage.warning(t('login.pleaseFill'))
     return
   }
   loading.value = true
   try {
     const data = await login(form.value)
     if (data && data.success) {
-      ElMessage.success('登录成功')
-      // 关键：先把全局 authed 同步为 true，AdminShell 才会从 Login 切到 AdminLayout
-      // 这里不能依赖 router.replace('/admin') —— 当用户已经在 /admin 时
-      // replace 同一路径不会触发任何变化，Login 会一直停留在屏幕。
-      await refresh()
+      // 登录后必须强制发起一轮新的会话检查，不能复用登录前尚未结束的 401 请求。
+      const authenticated = await refresh({ force: true })
+      if (!authenticated) {
+        ElMessage.error(t('login.sessionVerifyFailed'))
+        loadCaptcha()
+        return
+      }
+
+      ElMessage.success(t('login.loginSuccess'))
+
+      // 使用默认密码登录：弹出安全警告，引导用户尽快修改
+      if (data.requireChangePassword) {
+        await ElMessageBox.confirm(
+          `<div class="security-msg">
+            <div class="security-msg-icon">
+              <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                <line x1="12" y1="9" x2="12" y2="13"/>
+                <line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
+            </div>
+            <h3 class="security-msg-title">${t('login.securityTitle')}</h3>
+            <p class="security-msg-subtitle">${t('login.securitySub')}</p>
+            <div class="security-msg-card">
+              <div class="security-msg-row">
+                <span class="security-msg-label">${t('login.securityDefaultAccount')}</span>
+                <span class="security-msg-value">root</span>
+              </div>
+              <div class="security-msg-row">
+                <span class="security-msg-label">${t('login.securityDefaultPassword')}</span>
+                <span class="security-msg-value">admin@123</span>
+              </div>
+            </div>
+            <p class="security-msg-desc">
+              ${t('login.securityDesc')}
+            </p>
+          </div>          `,
+          t('login.securityTitle'),
+          {
+            dangerouslyUseHTMLString: true,
+            customClass: 'security-message-box',
+            confirmButtonText: t('login.changePasswordNow'),
+            cancelButtonText: t('login.later'),
+            confirmButtonClass: 'security-confirm-btn',
+            cancelButtonClass: 'security-cancel-btn',
+            closeOnClickModal: false,
+            closeOnPressEscape: false,
+            showClose: false
+          }
+        ).then(() => {
+          router.push({ name: 'user' })
+        }).catch(() => {})
+      }
+
       // 通知父级处理跳转到具体子路由（如果 intended 不在 /admin 本身）
       emit('logged-in')
     } else {
-      ElMessage.error((data && data.error) || '登录失败')
+      ElMessage.error((data && data.error) || t('login.loginFailed'))
       loadCaptcha()
     }
   } catch (e) {
@@ -152,14 +207,16 @@ async function onSubmit() {
 
 onMounted(async () => {
   loadCaptcha()
-  // 已登录用户直接进后台，避免停留在登录页
-  try {
-    const res = await checkSession()
-    if (res && res.authenticated) {
+
+  // /admin 下的登录组件由 AdminShell 统一检查会话，避免重复请求。
+  // 只有兼容入口 /admin/login 独立渲染 Login 时才主动检查。
+  if (route.name === 'admin-login') {
+    const authenticated = await refresh()
+    if (authenticated) {
       const target = props.redirect || route.query.redirect || '/admin'
       router.replace(target)
     }
-  } catch (_) {}
+  }
 })
 </script>
 
@@ -214,6 +271,15 @@ onMounted(async () => {
   padding: 4px 6px;
 }
 
+/* 语言切换器容器：卡片右上角对齐 */
+.login-card-head {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  min-height: 36px;     /* 锁高，避免 icon-only 按钮跳变影响下方品牌区对齐 */
+  margin-bottom: 4px;
+}
+
 /* ============ 品牌区 ============ */
 .brand {
   display: flex;
@@ -224,22 +290,22 @@ onMounted(async () => {
   text-align: center;
 }
 .brand-logo {
-  height: 64px;
+  height: 72px;
+  max-width: min(300px, 86%);
   width: auto;
   object-fit: contain;
-  filter: drop-shadow(0 6px 14px rgba(0, 80, 200, 0.18));
 }
 .brand-title {
   font-size: 24px;
   font-weight: 800;
   margin: 6px 0 0;
   letter-spacing: -0.02em;
-  color: #1d1d1f;
+  color: var(--fg);
 }
 .brand-sub {
   margin: 0;
   font-size: 13px;
-  color: #6e6e73;
+  color: var(--muted);
   letter-spacing: 0.2px;
 }
 
@@ -398,5 +464,30 @@ onMounted(async () => {
 .login-foot i {
   color: #34c759;
   font-size: 13px;
+}
+
+</style>
+
+<!-- 非 scoped：深色模式下让登录卡片背景/边框也走主题变量，
+     否则 .brand-title/.brand-sub 改成 var(--fg)/var(--muted) 后在浅色卡片上反而会看不清 -->
+<style>
+:root.dark .login-card {
+  background: rgba(30, 41, 59, 0.94) !important;
+  border-color: rgba(255, 255, 255, 0.08) !important;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55) !important;
+}
+:root.dark .login-wrap .field :deep(.el-input__wrapper) {
+  background: rgba(15, 23, 42, 0.7) !important;
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.45) inset !important;
+}
+:root.dark .login-wrap .field :deep(.el-input__wrapper.is-focus) {
+  background: rgba(15, 23, 42, 0.92) !important;
+  box-shadow: 0 0 0 1px var(--accent) inset, 0 0 0 4px rgba(34, 197, 94, 0.18) !important;
+}
+:root.dark .login-foot {
+  color: var(--muted-2);
+}
+:root.dark .login-foot i {
+  color: #4ade80;
 }
 </style>

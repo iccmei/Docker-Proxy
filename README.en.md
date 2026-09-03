@@ -4,7 +4,7 @@
 
 <div style="text-align: center">
   <p align="center">
-  <img src="https://github.com/dqzboy/Docker-Proxy/assets/42825450/c187d66f-152e-4172-8268-e54bd77d48bb" width="230px" height="200px">
+  <img src="./hubcmdui/src/public/images/docker-proxy.svg" width="200px" height="200px" alt="Docker Proxy Logo">
       <br>
       <i>Self-hosted Docker image acceleration service — one-click deployment of image acceleration & management for Docker, K8s, Quay, GHCR, MCR, Elastic, NVCR, and more.</i>
   </p>
@@ -44,12 +44,17 @@
 
 ## 🔨 Features
 - [x] **Zero disk cache**: A single process automatically routes by `Host` to major public registries (Docker Hub, GHCR, Quay, K8s, MCR, Elastic, NVCR, etc.), performs server-side token authentication and streams the response without writing to disk or consuming local storage.
-- [x] **One-click deployment**: Automatically checks and installs Docker / Compose dependencies, supporting both the image-pull mode (`docker-compose.yaml`) and the source-build mode (`docker-compose-build.yaml`).
+- [x] **One-click deployment**: Interactive menu: with a single click, complete “install dependencies → start Docker image acceleration → (optional) configure Nginx/Caddy reverse proxy”.
 - [x] **Optional reverse proxy**: Automatically deploys Nginx or Caddy as a reverse proxy and renders the corresponding configuration (HTTPS, Host rewriting).
 - [x] **Upstream account authentication**: You can configure an upstream username/password; the proxy server exchanges them for a Bearer Token, enabling pulls of private Docker Hub images and mitigating official rate limits.
 - [x] **HubCMD-UI management panel**: Manage proxies, configure server parameters, and hot-reload directly from the web UI; includes image search, documentation tutorials, container management, monitoring, and alerting.
+- [x] **System Dashboard**: Real-time monitoring of server resources, container runtime status, and network traffic information
 - [x] **Cross-platform images**: Supports deployment on mainstream architectures such as `linux/amd64` and `linux/arm64`.
 - [x] **Daily operations management**: Provides full lifecycle management including service start / stop / restart / logs / update / uninstall.
+- [x] **Traffic Monitoring and Alerts**: Provides detailed client-side traffic metrics for server bandwidth throughput and image pull operations, along with threshold-based monitoring and alerting.
+- [x] **Registry Management**: Each registry has independent configuration management, enabling online management of image proxies (registries) and service settings without the need to manually edit configuration files.
+- [x] **IP Access Control**: IP blacklists and whitelists to control who can pull images from this service. Supports both individual IPs and CIDR blocks.
+
 
 ## 📦 Deployment
 
@@ -81,7 +86,7 @@ bash -c "$(curl -fsSL https://ghp.ci/https://raw.githubusercontent.com/dqzboy/Do
 
 > The script automatically: checks and installs Docker / Docker Compose; generates a random `GO_PROXY_ADMIN_TOKEN` and writes it to `.env`; optionally deploys Nginx / Caddy reverse proxy.
 
-After deployment, visit `http://<server-IP>:30080/admin` to manage proxies and server parameters from the web UI (you must register an admin account on first use; there is no built-in default account).
+After deployment, visit `http://<server-IP>:30080/admin` to manage proxies and server parameters from the web UI.
 
 ### Config persistence & upgrades (Important)
 The config file is mounted on the host at `./config/go-proxy/` (inside the container: `/app/config.d/config.yaml`).
@@ -93,7 +98,7 @@ The config file is mounted on the host at `./config/go-proxy/` (inside the conta
 
 ## 💻 Hubcmd-UI
 
-**Default account**: root / admin@123
+**Default account**: root / admin@123   **Please change the default account and password promptly after deployment.**
 
 <br/>
 <table>
@@ -114,52 +119,108 @@ The config file is mounted on the host at `./config/go-proxy/` (inside the conta
         <td width="50%" align="center"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/hubcmdui-registry-manager.png?raw=true"></td>
     </tr>
     <tr>
-      <td width="50%" align="center"><b>Container Management</b></td>
-      <td width="50%" align="center"><b>Monitoring & Alerting</b></td>
+      <td width="50%" align="center"><b>System Dashboard</b></td>
+      <td width="50%" align="center"><b>Traffic Monitoring</b></td>
     </tr>
     <tr>
-        <td width="50%" align="center"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/hubcmdui-docker-manager.png?raw=true"></td>
-        <td width="50%" align="center"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/hubcmdui-alter.png?raw=true"></td>
+        <td width="50%" align="center"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/hubcmd-ui-dashboard.png?raw=true"></td>
+        <td width="50%" align="center"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/hubcmdui-Traffic.png?raw=true"></td>
+    </tr>
+    <tr>
+      <td width="50%" align="center"><b>Access Control</b></td>
+      <td width="50%" align="center"><b>Network Testing</b></td>
+    </tr>
+    <tr>
+        <td width="50%" align="center"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/hubcmd-ui-ipaccess.png?raw=true"></td>
+        <td width="50%" align="center"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/hubcmdui-network-test.png?raw=true"></td>
     </tr>
 </table>
+
+---
+
+## 🛠 Local Development
+
+For developers participating in secondary development, debugging, or building images locally. The two sub-projects (`go-proxy/` and `hubcmdui/`) are **independent** and can be run separately.
+
+### go-proxy (Go backend)
+
+**Prerequisite**: Go ≥ 1.23 (explicitly required in `go-proxy/go.mod` as 1.23.0)
+
+```bash
+cd go-proxy
+# Method A: Auto-discovers config.local.yaml > config.yaml > config.example.yaml in the current directory
+go run .
+# Method B: Pass an explicit config file
+go run . ./config.local.yaml
+```
+
+After startup:
+
+| Port | Purpose | Exposure |
+| --- | --- | --- |
+| `:5000` | OCI Registry reverse proxy (`/v2/` main entry) | Public / behind reverse proxy |
+| `:5001` | Admin API (`/-/healthz`, `/-/config`, `/-/reload`, `/-/stats`, `/-/credentials`) | **Internal only** |
+
+> ⚠️ **About `GO_PROXY_ADMIN_TOKEN`**: The admin API uses independent admin token authentication with **strict startup validation** — placeholder tokens (`change-me` / `admin` / empty string, etc.) or length < 16 will **directly refuse to start**. For local development, at minimum set a 16+ character random value:
+>
+> ```bash
+> export GO_PROXY_ADMIN_TOKEN="$(openssl rand -hex 16)"
+> ```
+
+### hubcmdui (Web UI)
+
+**Prerequisite**: Node.js ≥ 18 (20 LTS recommended)
+
+```bash
+cd hubcmdui
+npm install
+# Start dev server
+npm run dev
+```
+
+Service listens on `:3000` by default; admin entry at `http://localhost:3000/admin`; default account `root / admin@123` (**forced password change on first login**)
 
 ---
 
 ## 💌 Promotion
 
 <table>
-  <thead>
-    <tr>
-      <th width="50%" align="center">Description</th>
-      <th width="50%" align="center">Overview</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td width="50%" align="left">
-        <a href="https://dqzboy.github.io/proxyui/racknerd" target="_blank">Provides cost-effective overseas VPS with support for multiple operating systems, suitable for building Docker proxy services.</a>
-      </td>
-      <td width="50%" align="center">
-        <a href="https://dqzboy.github.io/proxyui/racknerd" target="_blank">
-          <img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/dqzboy-proxy/Image_2025-07-07_16-14-49.png?raw=true" alt="RackNerd" width="200" height="150">
-        </a>
-      </td>
-    </tr>
-    <tr>
-      <td width="50%" align="left">
-        <a href="https://dqzboy.github.io/proxyui/CloudCone" target="_blank">CloudCone provides flexible cloud server plans with pay-as-you-go billing, suitable for both individual and enterprise users.</a>
-      </td>
-      <td width="50%" align="center">
-        <a href="https://dqzboy.github.io/proxyui/CloudCone" target="_blank">
-          <img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/dqzboy-proxy/111.png?raw=true" alt="CloudCone" width="200" height="150">
-        </a>
-      </td>
-    </tr>
-  </tbody>
+  <tr>
+    <td width="33.33%" align="center">
+      <a href="https://aihub.top/register?aff=RXYDWRNDZ4AU"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/AIHUB.png?raw=true" alt="AIHUB" width="280" height="158"><br><strong>AIHUB</strong></a><br>
+      <sub>Reliable and affordable AI API relay service</sub>
+    </td>
+    <td width="33.33%" align="center">
+      <a href="https://docker-proxy-desc.vercel.app/dedione.html"><img src=https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/dedione-vps.png?raw=true" alt="DediOne" width="280" height="158"><br><strong>DediOne</strong></a><br>
+      <sub>Fast and reliable web hosting services</sub>
+    </td>
+    <td width="33.33%" align="center">
+      <a href="https://docker-proxy-desc.vercel.app/dedirock.html"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/picture/DediRock.png?raw=true" alt="DediRock" width="280" height="158"><br><strong>DediRock</strong></a><br>
+      <sub>Cost-effective VPS across multiple U.S. data centers</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="33.33%" align="center">
+      <a href="https://docker-proxy-desc.vercel.app/racknerd.html"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/dqzboy-proxy/Image_2025-07-07_16-14-49.png?raw=true" alt="RackNerd" width="280" height="158"><br><strong>RackNerd</strong></a><br>
+      <sub>Overseas VPS for websites and Docker services</sub>
+    </td>
+    <td width="33.33%" align="center">
+      <a href="https://docker-proxy-desc.vercel.app/cloudcone.html"><img src="https://cdn.jsdelivr.net/gh/dqzboy/Images/dqzboy-proxy/111.png?raw=true" alt="CloudCone" width="280" height="158"><br><strong>CloudCone</strong></a><br>
+      <sub>Flexible pay-as-you-go cloud servers</sub>
+    </td>
+    <td width="33.33%"><!-- New promotion slot --></td>
+  </tr>
 </table>
 
-##### *Telegram Bot: [Click to contact](https://t.me/RelayHubBot) ｜ E-Mail: support@dqzboy.com*
-**We only accept merchants with long-term stable operations and good reputation.**
+---
+
+<p align="center">
+  <strong>Promotion Partnerships</strong><br>
+  We only accept reputable providers with stable, long-term operations<br>
+  <a href="https://t.me/RelayHubBot">Telegram</a> · <a href="mailto:support@dqzboy.com">support@dqzboy.com</a>
+</p>
+
+---
 
 ## 🤝 Contributing
 

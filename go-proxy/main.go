@@ -1,12 +1,21 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 )
 
 // adminPasswordSentinel is the value the UI sends back when the password field
@@ -14,12 +23,40 @@ import (
 // keeps the existing password instead of overwriting it.
 const adminPasswordSentinel = "********"
 
+// resolveConfigPath picks the YAML config to use:
+//   1. explicit positional argument, e.g. `./go-proxy /etc/dqz-proxy/config.yaml`
+//   2. files auto-discovered in the working directory, in priority order:
+//      config.local.yaml (typical dev override) > config.yaml (committed default) > config.example.yaml
+//
+// When the operator is sitting in the repo with no flag, they'd otherwise see
+// "usage: registry-proxy <config.yaml>" and exit — which looks like a crash
+// rather than the documented requirement of pointing at a YAML. Picking up the
+// first existing file matches what `make run` / `go run .` users actually want.
+func resolveConfigPath(args []string) (string, error) {
+	if len(args) >= 1 {
+		p := args[0]
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+		return "", fmt.Errorf("指定的配置文件 %q 不存在", p)
+	}
+	candidates := []string{"config.local.yaml", "config.yaml", "config.example.yaml"}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			log.Printf("未指定配置文件，自动使用当前目录下的 %s", c)
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("当前目录下未找到 config.yaml / config.local.yaml / config.example.yaml，请显式指定配置路径")
+}
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: registry-proxy <config.yaml>")
+	configPath, err := resolveConfigPath(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		fmt.Fprintln(os.Stderr, "usage: registry-proxy [config.yaml]")
 		os.Exit(2)
 	}
-	configPath := os.Args[1]
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
@@ -54,8 +91,25 @@ func main() {
 	adminMux.HandleFunc("/-/config", func(w http.ResponseWriter, r *http.Request) {
 		handleAdminConfig(w, r, proxy, configPath, adminToken)
 	})
+	adminMux.HandleFunc("/-/credentials", func(w http.ResponseWriter, r *http.Request) {
+		handleAdminCredentials(w, r, proxy, adminToken)
+	})
 	adminMux.HandleFunc("/-/reload", func(w http.ResponseWriter, r *http.Request) {
 		handleAdminReload(w, r, proxy, configPath, adminToken)
+	})
+	adminMux.HandleFunc("/-/stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Get("reset") == "1" {
+			proxy.resetStats()
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "reset": true})
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"clients": proxy.snapshotStats(),
+		})
 	})
 
 	adminHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -83,15 +137,22 @@ func main() {
 	}
 }
 
-// handleAdminConfig implements GET (return current config, passwords masked) and
-// PUT (replace config: validate, write YAML, hot-reload).
+// handleAdminConfig implements GET (return current config, passwords always masked)
+// and PUT (replace config: validate, write YAML, hot-reload).
+//
+// include_secrets=1 is intentionally ignored for backwards compatibility. It
+// must never turn this general-purpose configuration endpoint into a plaintext
+// secret disclosure API.
 func handleAdminConfig(w http.ResponseWriter, r *http.Request, proxy *Proxy, configPath, adminToken string) {
 	switch r.Method {
 	case http.MethodGet:
 		proxy.routeMux.RLock()
 		out := *proxy.cfg
+		// The top-level copy above still shares the Registries slice with the
+		// live config. Clone it before masking so a UI GET can never replace the
+		// credentials used by the running proxy with ********.
+		out.Registries = append([]RegistryConfig(nil), proxy.cfg.Registries...)
 		proxy.routeMux.RUnlock()
-		// Mask passwords so they never leave the server.
 		for i := range out.Registries {
 			if out.Registries[i].Auth.Password != "" {
 				out.Registries[i].Auth.Password = adminPasswordSentinel
@@ -138,6 +199,78 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request, proxy *Proxy, con
 	}
 }
 
+// credentialSyncResponse is an encrypted, machine-to-machine response used by
+// hubcmd-ui to synchronize registry credentials without putting plaintext
+// passwords on the admin HTTP wire. The encryption key is derived from the
+// already-required GO_PROXY_ADMIN_TOKEN, so no additional deployment secret is
+// needed. The payload is base64(nonce || ciphertext || auth tag).
+type credentialSyncResponse struct {
+	Algorithm string `json:"algorithm"`
+	Payload   string `json:"payload"`
+}
+
+func credentialSyncKey(adminToken string) []byte {
+	sum := sha256.Sum256([]byte(adminToken))
+	return sum[:]
+}
+
+func encryptCredentialSyncPayload(registries []RegistryConfig, adminToken string) (credentialSyncResponse, error) {
+	if adminToken == "" {
+		return credentialSyncResponse{}, errors.New("GO_PROXY_ADMIN_TOKEN 未配置，无法安全同步凭证")
+	}
+
+	plaintext, err := json.Marshal(struct {
+		Registries []RegistryConfig `json:"registries"`
+	}{Registries: registries})
+	if err != nil {
+		return credentialSyncResponse{}, fmt.Errorf("序列化凭证失败: %w", err)
+	}
+
+	block, err := aes.NewCipher(credentialSyncKey(adminToken))
+	if err != nil {
+		return credentialSyncResponse{}, fmt.Errorf("初始化凭证加密失败: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return credentialSyncResponse{}, fmt.Errorf("初始化凭证加密失败: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return credentialSyncResponse{}, fmt.Errorf("生成凭证加密随机数失败: %w", err)
+	}
+
+	// gcm.Seal appends the authentication tag to the ciphertext.
+	sealed := gcm.Seal(nonce, nonce, plaintext, nil)
+	return credentialSyncResponse{
+		Algorithm: "AES-256-GCM",
+		Payload:   base64.StdEncoding.EncodeToString(sealed),
+	}, nil
+}
+
+// handleAdminCredentials returns an encrypted credential-sync payload. Unlike
+// /-/config?include_secrets=1, this endpoint never serializes a plaintext
+// password into the HTTP response.
+func handleAdminCredentials(w http.ResponseWriter, r *http.Request, proxy *Proxy, adminToken string) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if adminToken == "" {
+		writeJSONError(w, http.StatusServiceUnavailable, "未配置 GO_PROXY_ADMIN_TOKEN，无法安全同步凭证")
+		return
+	}
+
+	proxy.routeMux.RLock()
+	registries := append([]RegistryConfig(nil), proxy.cfg.Registries...)
+	proxy.routeMux.RUnlock()
+	response, err := encryptCredentialSyncPayload(registries, adminToken)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 // handleAdminReload re-reads the on-disk config file and hot-reloads.
 func handleAdminReload(w http.ResponseWriter, r *http.Request, proxy *Proxy, configPath, adminToken string) {
 	if r.Method != http.MethodPost {
@@ -158,6 +291,9 @@ func handleAdminReload(w http.ResponseWriter, r *http.Request, proxy *Proxy, con
 func validateConfig(cfg *Config) error {
 	if len(cfg.Registries) == 0 {
 		return fmt.Errorf("至少需要配置一个 registry")
+	}
+	if err := validateAccessControl(&cfg.AccessControl); err != nil {
+		return err
 	}
 	names := make(map[string]bool)
 	for _, r := range cfg.Registries {
@@ -184,6 +320,53 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// validateAccessControl checks the IP allow/deny configuration. Invalid IPs or
+// CIDRs are rejected here so a bad rule can never fail silently (unlike the old
+// iptables batch apply, where one bad entry broke the whole batch).
+func validateAccessControl(ac *AccessControl) error {
+	switch ac.Mode {
+	case "", ACLModeOff, ACLModeWhitelist, ACLModeBlacklist:
+	default:
+		return fmt.Errorf("access_control.mode 非法: %q (应为 off / whitelist / blacklist)", ac.Mode)
+	}
+	if ac.Mode == ACLModeWhitelist && len(ac.Whitelist) == 0 {
+		return fmt.Errorf("白名单模式至少需要配置一个 IP/CIDR")
+	}
+	for _, e := range ac.Whitelist {
+		if err := checkIPRule(e); err != nil {
+			return err
+		}
+	}
+	for _, e := range ac.Blacklist {
+		if err := checkIPRule(e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkIPRule validates a single allow/deny entry: a plain IP or a CIDR, with
+// an optional inline "# comment".
+func checkIPRule(raw string) error {
+	e := strings.TrimSpace(raw)
+	if e == "" {
+		return fmt.Errorf("存在空的 IP 规则")
+	}
+	if i := strings.IndexByte(e, '#'); i >= 0 {
+		e = strings.TrimSpace(e[:i])
+	}
+	if e == "" {
+		return nil
+	}
+	if _, _, err := net.ParseCIDR(e); err == nil {
+		return nil
+	}
+	if net.ParseIP(e) != nil {
+		return nil
+	}
+	return fmt.Errorf("非法的 IP/CIDR: %q", raw)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
